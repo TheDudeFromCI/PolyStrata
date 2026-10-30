@@ -648,9 +648,14 @@ int serve(Session& ss) {
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
                 (long long) engine.vram_free_mib(), (int) slots.size());
 #ifdef STRATA_POLY_LLGUIDANCE
+    std::string grammar_reason = engine.json_grammar_rejection();
+    if (grammar_reason.empty() && engine.drafts()) grammar_reason = "drafts_enabled";
+    if (grammar_reason.empty() && !slots.empty()) grammar_reason = "batching_enabled";
+    std::printf("INFO json_schema_reason=%s\n", grammar_reason.empty() ? "ready" : grammar_reason.c_str());
     std::printf("READY %d stop%s\n", engine.max_context(),
-                engine.supports_json_grammar() && !engine.drafts() && slots.empty() ? " json_schema_llguidance" : "");
+                grammar_reason.empty() ? " json_schema_llguidance" : "");
 #else
+    std::printf("INFO json_schema_reason=not_compiled\n");
     std::printf("READY %d stop\n", engine.max_context());
 #endif
     std::fflush(stdout);

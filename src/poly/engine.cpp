@@ -3783,12 +3783,20 @@ int most_likely(const float* logits, int n) {
 }  // namespace strata::poly
 
 namespace strata::poly {
-bool Engine::supports_json_grammar() const {
+std::string Engine::json_grammar_rejection() const {
     const auto* a = gg_->get("general.architecture");
     const auto* name = gg_->get("general.name");
     std::string model = name ? name->s : "";
     std::transform(model.begin(), model.end(), model.begin(), [](unsigned char c) { return c >= 'A' && c <= 'Z' ? char(c + 32) : char(c); });
-    return model.find("qwen3.6") != std::string::npos && a && a->s == "qwen35moe" && n_layer_ == 40 && n_embd_ == 2048 && n_expert_ == 256;
+    if (!a || a->s != "qwen35moe") return "architecture_mismatch";
+    if (model.find("qwen3.6") == std::string::npos) return "model_name_mismatch";
+    if (n_layer_ != 40) return "layer_count_mismatch";
+    if (n_embd_ != 2048) return "embedding_width_mismatch";
+    if (n_expert_ != 256) return "expert_count_mismatch";
+    return {};
+}
+bool Engine::supports_json_grammar() const {
+    return json_grammar_rejection().empty();
 }
 void Engine::validate_grammar_tokens(const std::vector<std::string>& pieces, int close) const {
     if (!supports_json_grammar()) throw std::runtime_error("structured decoding requires Qwen3.6-35B-A3B");

@@ -104,6 +104,17 @@ class Protocol(unittest.TestCase):
             with poly_grammar.request(SimpleNamespace(), Vocabulary(), {256}, {'type': 'object'}):
                 self.fail('unsupported engine accepted')
 
+    def test_capability_rejection_reasons(self):
+        engine=SimpleNamespace(json_schema_llguidance=False, info={})
+        self.assertIn("did not advertise",poly_grammar.unavailable_reason(engine))
+        for reason,message in poly_grammar.REASONS.items():
+            engine.info={"json_schema_reason":reason}
+            self.assertEqual(poly_grammar.unavailable_reason(engine),message)
+        engine.json_schema_llguidance=True
+        self.assertIsNone(poly_grammar.unavailable_reason(engine))
+        engine.batch=1
+        self.assertIn("Batching",poly_grammar.unavailable_reason(engine))
+
     def test_extensions_cannot_weaken_grammar(self):
         for key in ('x-guidance', 'not', 'uniqueItems', 'unevaluatedProperties'):
             with self.assertRaises(ValueError):

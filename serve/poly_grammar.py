@@ -16,6 +16,31 @@ def supported(engine):
     return bool(getattr(engine, "json_schema_llguidance", False)) and not getattr(engine, "batch", 0) and (not hasattr(engine, "alive") or engine.alive())
 
 
+REASONS = {
+    "not_compiled": "The running strata-poly executable was built without STRATA_POLY_LLGUIDANCE=ON.",
+    "drafts_enabled": "The running engine has draft generation enabled; add --no-draft and restart it.",
+    "batching_enabled": "Batching is enabled; remove --batch and restart the engine.",
+    "model_name_mismatch": "GGUF general.name did not identify Qwen3.6; the metadata name check rejected it.",
+    "architecture_mismatch": "GGUF architecture is not qwen35moe.",
+    "layer_count_mismatch": "GGUF layer count did not match the expected 40 layers.",
+    "embedding_width_mismatch": "GGUF embedding width did not match the expected 2048.",
+    "expert_count_mismatch": "GGUF expert count did not match the expected 256.",
+}
+
+
+def unavailable_reason(engine):
+    if supported(engine):
+        return None
+    if hasattr(engine, "alive") and not engine.alive():
+        return "The engine is not currently loaded."
+    if getattr(engine, "batch", 0):
+        return REASONS["batching_enabled"]
+    reason = (getattr(engine, "info", {}) or {}).get("json_schema_reason")
+    return REASONS.get(reason, "The running executable did not advertise json_schema_llguidance. "
+                       "Check the configured exe path, STRATA_POLY_LLGUIDANCE=ON, --no-draft, "
+                       "and that --batch is absent; older binaries do not report the exact failed check.")
+
+
 # Reject extension keywords before llguidance compilation: x-guidance can weaken schema semantics.
 KEYWORDS = set("type properties required additionalProperties items prefixItems minItems maxItems "
                "enum const anyOf oneOf allOf $ref $defs definitions minimum maximum exclusiveMinimum "
@@ -68,7 +93,7 @@ def write_request(file, tok, stop_ids, schema):
 @contextlib.contextmanager
 def request(engine, tok, stop_ids, schema):
     if not supported(engine):
-        raise ValueError("structured output requires the llguidance-enabled Linux/CUDA Qwen3.6 strata-poly engine (MTP and batching off)")
+        raise ValueError("Structured output unavailable: " + unavailable_reason(engine))
     check_keywords(schema)
     executable = Path(engine.spawn[0])
     if not executable.is_absolute() and len(engine.spawn) > 2 and engine.spawn[2]:

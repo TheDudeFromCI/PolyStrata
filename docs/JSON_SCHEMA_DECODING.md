@@ -160,3 +160,31 @@ The mock tests do not verify a real client's installed Pydantic AI version.
   disabled. Python syntax checks and `git diff --check` passed.
 - No model files were downloaded, installed, loaded or executed. Full CUDA
   compilation/linking and real-model inference remain unverified.
+
+## Launcher configuration and diagnostics
+
+`./setup.sh` runs the installer/launcher. It selects its saved `strata-*.json`
+configuration and normally uses `engine-poly/strata-poly`. It does not select a
+binary just because you built `build-json/strata-poly`. Its build path does not
+enable the opt-in llguidance feature. For this custom build, set the active
+configuration's `exe` to the absolute path of `build-json/strata-poly`, add
+`--no-draft` to its existing `args` list, and remove `--batch` and its value if
+present. Keep the model path, layer split, context and memory settings.
+
+Start that configuration directly, so installer engine selection/build logic
+cannot replace the custom executable:
+
+```sh
+.venv/bin/python serve/server.py --engine strata --config /absolute/path/to/strata-YOUR-MODEL.json
+```
+
+Here `--engine strata` selects the existing Python native-process wrapper; the
+configuration's `exe` selects the actual `strata-poly` executable.
+
+With the diagnostic update, `/v1/status.structured_output.unavailable_reason`
+reports the native gate that failed: missing compile option, draft generation,
+batching, GGUF name, architecture or shape. Older native executables cannot
+report an exact gate; the server then says their READY line lacks the capability
+flag. A one-request concurrency value alone cannot diagnose draft generation or
+which executable is running. Two GPUs appearing in telemetry is not a rejection
+condition in this code.
