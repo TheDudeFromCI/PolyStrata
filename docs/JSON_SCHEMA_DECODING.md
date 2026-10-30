@@ -198,3 +198,35 @@ updated verifier. See [JSON_SCHEMA_DRAFTS.md](JSON_SCHEMA_DRAFTS.md). A one-requ
 concurrency value alone cannot diagnose draft generation or
 which executable is running. Two GPUs appearing in telemetry is not a rejection
 condition in this code.
+
+## One-command build
+
+After syncing the implementation branch, run `./build.sh` from the checkout.
+It works from other working directories too. It fetches the exact llguidance and
+llama.cpp source commits above into `third_party/`, creates/reuses `.venv`, installs
+`requirements-grammar.txt` (including CMake/Ninja), selects Rust 1.95.0 through
+rustup when available, and builds `strata-poly` plus `poly-grammar-check` together
+in `build-json/`. Existing conflicting or modified dependency checkouts are
+reported instead of reset. Source fetches use normal Git/TLS authentication.
+
+System prerequisites: Git, Python 3.10+ with venv/pip, a C++20 compiler compatible
+with your CUDA toolkit, Cargo (normally installed via rustup), and CUDA. The
+script does not install drivers, system packages or rustup, and never calls the
+model installer, downloads weights, launches inference, or edits model configs.
+The defaults target your RTX 3060 and RTX 5060 (`86;120`, requiring CUDA 12.8+).
+
+```sh
+./build.sh                          # default CUDA engine/helper build, 4 jobs
+./build.sh --jobs 2                  # reduce compiler memory use
+./build.sh --arch '86'               # build solely for an RTX 3060
+./build.sh --fetch-only              # source dependencies only
+./build.sh --test                    # CPU-only native + mock API verification
+```
+
+`--build-dir PATH` overrides the build directory. Test mode defaults to
+`build-json-tests/` and installs pytest 9.2.0. `STRATA_CUDA_ARCHITECTURES` can
+supply the default architecture list; `CUDACXX` can select an nvcc executable.
+If CUDA is not on PATH, `/opt/cuda/bin/nvcc` and `/usr/local/cuda/bin/nvcc` are
+also checked. Stop the running server before rebuilding its executable, then
+restart using the custom-build configuration described above. MTP remains
+controlled by the configuration's existing `--no-draft` argument.

@@ -71,3 +71,8 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
+
+# Pinned source dependency fetched by build.sh
+/third_party/llguidance/
+/third_party/.llguidance-fetch.*/
+/third_party/.llama.cpp-fetch.*/
