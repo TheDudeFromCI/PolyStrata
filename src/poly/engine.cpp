@@ -1,6 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
+#include "grammar_token_bytes.hpp"
 
 #include "deepseek4.hpp"
 #include "gemma4.hpp"
@@ -3780,3 +3781,26 @@ int most_likely(const float* logits, int n) {
 }
 
 }  // namespace strata::poly
+
+namespace strata::poly {
+bool Engine::supports_json_grammar() const {
+    const auto* a = gg_->get("general.architecture");
+    const auto* name = gg_->get("general.name");
+    std::string model = name ? name->s : "";
+    std::transform(model.begin(), model.end(), model.begin(), [](unsigned char c) { return c >= 'A' && c <= 'Z' ? char(c + 32) : char(c); });
+    return model.find("qwen3.6") != std::string::npos && a && a->s == "qwen35moe" && n_layer_ == 40 && n_embd_ == 2048 && n_expert_ == 256;
+}
+void Engine::validate_grammar_tokens(const std::vector<std::string>& pieces, int close) const {
+    if (!supports_json_grammar()) throw std::runtime_error("structured decoding requires Qwen3.6-35B-A3B");
+    const auto* tokens = gg_->get("tokenizer.ggml.tokens");
+    const auto* types = gg_->get("tokenizer.ggml.token_type");
+    if (!tokens || !types || tokens->items.size() != pieces.size() || pieces.size() != size_t(n_vocab_) ||
+        types->items.size() != pieces.size()) throw std::runtime_error("grammar tokenizer metadata mismatch");
+    if (close < 0 || size_t(close) >= pieces.size() || tokens->items[close].s != "</think>")
+        throw std::runtime_error("invalid reasoning transition token");
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (grammar_token_bytes(tokens->items[i].s, types->items[i].u) != pieces[i])
+            throw std::runtime_error("grammar tokenizer bytes differ from model at ID " + std::to_string(i));
+    }
+}
+}

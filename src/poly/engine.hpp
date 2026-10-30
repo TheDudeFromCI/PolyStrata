@@ -186,6 +186,8 @@ public:
     static std::unique_ptr<Engine> open(const Options& o);
     void load(const Options& o);
 
+    bool supports_json_grammar() const;
+    void validate_grammar_tokens(const std::vector<std::string>& pieces, int close) const;
     int n_vocab() const { return n_vocab_; }
     /// The rows of the output a guess is picked from.  A guess that is never right costs a window's place and no
     /// token, so the rare tokens may be left out, where the vocabulary has the common ones first.

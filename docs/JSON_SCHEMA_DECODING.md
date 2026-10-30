@@ -1,0 +1,162 @@
+# Qwen3.6 structured responses with llguidance
+
+This opt-in decoder targets Qwen3.6-35B-A3B, Linux, NVIDIA CUDA, `strata-poly`,
+`/v1/chat/completions`, with MTP and batching off. It does not change `strata`.
+No model files are needed for the tests below. Do not run setup.py or setup.sh for these tests.
+
+## Build and deploy
+
+Install the normal CUDA build prerequisites from docs/BACKENDS.md (on Manjaro:
+the NVIDIA driver, CUDA toolkit, GCC supported by that toolkit, CMake, Ninja,
+Python 3.10+). Install Rust 1.95.0 with Cargo. Then, from the project root:
+
+```sh
+git clone https://github.com/guidance-ai/llguidance.git third_party/llguidance
+git -C third_party/llguidance checkout 3d698ee07b3a67b0aef50fb6058612e8fd30aca2
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-grammar.txt pytest==9.2.0
+cmake -S . -B build-json -G Ninja -DSTRATA_ENABLE_CUDA=ON \
+  -DSTRATA_POLY_LLGUIDANCE=ON -DSTRATA_BUILD_TESTS=ON \
+  -DLLGUIDANCE_SOURCE_DIR="$PWD/third_party/llguidance"
+cmake --build build-json --target strata-poly poly-grammar-check poly-json-grammar-test poly-json-sampler-test -j4
+```
+
+Use the existing Qwen3.6 model configuration, with `exe` pointing to the newly
+built `strata-poly` and `--no-draft` in `args`. Leave batching off. Install
+`poly-grammar-check` beside `strata-poly` if moving the executables. This helper
+validates schemas locally; it never loads a model. The Cargo lockfile and exact
+source commit pin llguidance 1.9.1. A wrong source commit is a CMake error.
+
+`/v1/status.structured_output.constrained_decoding` must be true and `method`
+must be `llguidance` after loading this engine. Native READY advertises
+`json_schema_llguidance` only for the supported model shape, with drafts/batching
+off. Unsupported engines reject structured OpenAI requests, rather than falling
+back to prompt-only generation. Ordinary text requests retain their previous path.
+
+## Requests and reasoning
+
+Use the standard OpenAI `response_format` with `type: json_schema`, a name, and
+an object-root schema, or `type: json_object`. Pydantic AI's OpenAI provider and
+`NativeOutput(MyPydanticModel)` send this format; no custom client settings are
+needed. Set `reasoning_effort` to low, medium or high as before; explicit none
+also works. `max_completion_tokens` counts reasoning and final tokens together.
+
+The server exports the exact inference tokenizer's raw token bytes, without
+UTF-8 replacement, to a private local request file. Before generating, the native
+engine checks every byte against its loaded GGUF's GPT-2 byte alphabet and
+special-token metadata. Special tokens are excluded from the JSON vocabulary.
+The native C API builds one matcher per generation segment. Its trie matches
+multi-character tokens, partial UTF-8 and JSON escapes across token boundaries.
+No custom schema compiler is used. The matcher's no-fast-forward path uses the
+byte trie only; llguidance's approximate encode callback is never used to generate
+tokens or change token IDs.
+
+While reasoning, logits are unrestricted and the matcher consumes no tokens.
+Only the actual `</think>` special-token ID switches to the fresh JSON state.
+Ordinary tokens spelling similar text do not switch phases. The API uses the
+same token-ID transition and emits reasoning through `reasoning_content`; it
+never feeds final JSON through the text-based reasoning/tool marker parser.
+Existing reasoning budget wrap-up inserts its closing special token and resumes
+with a fresh final-answer matcher. Premature EOS does not trigger the old
+reasoning-close retry. Budget exhaustion before a complete answer is an error.
+
+Every final token is sampled from grammar-masked CPU logits before penalties,
+top-k, top-p, min-p, temperature and the draw. The original logits remain intact.
+The engine stops at accepting root completion, without requiring an EOS draw.
+All lookup and draft speculation is bypassed for the whole constrained request,
+including its reasoning phase. No extra GPU transfer or per-token Python grammar
+callback is introduced. Final content is buffered, parsed as exactly one JSON
+object, and independently validated before delivery; prose extraction is disabled.
+
+## Schemas and errors
+
+The supported subset uses Draft 2020-12 and the pinned llguidance strict compiler:
+objects/nested objects, properties and required fields, additionalProperties,
+arrays/items, primitive types, enums/const, anyOf/nullable unions, local $ref and
+$defs, string length/pattern/recognized format and numeric bounds/multipleOf.
+Properties have schema-defined order. Some allOf/oneOf, property-count and
+patternProperties combinations are unsupported; compilation errors and warnings
+are client errors. Unsupported keywords (including uniqueItems, not,
+unevaluatedProperties and x-guidance extensions) are rejected, never dropped.
+Remote references are forbidden. This is not complete JSON Schema support.
+llguidance does not enforce uniqueness of dynamically named properties; the
+independent duplicate-key check rejects such an output rather than returning it.
+
+Invalid schema/unsupported engine requests return 400 before generation. Native
+mask/matcher/tokenizer errors use `structured_output_failed`; no valid token,
+premature EOS, incomplete output or independent validation failure cannot return
+a successful structured completion. Streaming may already have HTTP 200 headers;
+failures then appear as error events without a successful content delta. Python
+`jsonschema` is required for schema mode and may not silently degrade validation.
+
+## Model-free verification
+
+The grammar targets can be built without CUDA for local tests:
+
+```sh
+cmake -S . -B build-json-tests -G Ninja -DSTRATA_NATIVE_EXPERTS=OFF \
+  -DSTRATA_POLY_LLGUIDANCE=ON -DSTRATA_BUILD_TESTS=ON \
+  -DLLGUIDANCE_SOURCE_DIR="$PWD/third_party/llguidance"
+cmake --build build-json-tests --target poly-grammar-check poly-json-grammar-test poly-json-sampler-test -j4
+ctest --test-dir build-json-tests -R '^poly-json-sampler-test$' --output-on-failure
+POLY_GRAMMAR_TEST="$PWD/build-json-tests/poly-json-grammar-test" \
+POLY_GRAMMAR_CHECK="$PWD/build-json-tests/poly-grammar-check" \
+  .venv/bin/python -m pytest -q serve/test_poly_grammar.py serve/test_structured.py serve/test_effort_paths.py
+```
+
+Fixtures cover Pydantic-shaped objects, arrays, nullable values, refs, Unicode,
+escapes, numeric constraints, invalid high logits, EOS, incomplete prefixes,
+matcher isolation, reasoning and HTTP buffering. The sampler test exercises the
+actual production sampler with synthetic logits and penalties/sampling filters.
+There are no model weights or GPU inference in these tests.
+
+Per-token overhead is a native grammar mask plus one vocabulary pass into a
+reusable float buffer. No mask work occurs during reasoning. Per-request costs
+include vocabulary export/checking, schema preflight and tokenizer-trie creation;
+these are not cached yet. Structured requests lose speculative speedups. No
+real-model throughput or reliability measurement is claimed. Complete CUDA
+linking, GPU execution and the actual Qwen tokenizer/model combination require
+verification on the target machine; the development test machine has no CUDA
+compiler. Mock tests cannot establish real-model reliability.
+
+Example client (using the current Pydantic AI OpenAI chat adapter):
+
+```python
+from pydantic import BaseModel
+from pydantic_ai import Agent, NativeOutput
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+class Answer(BaseModel):
+    success: bool
+    count: int
+    message: str
+
+model = OpenAIChatModel(
+    'qwen3.6-35b-a3b',
+    provider=OpenAIProvider(base_url='http://127.0.0.1:8080/v1', api_key='unused'),
+)
+agent = Agent(model, output_type=NativeOutput(Answer))
+result = agent.run_sync('Think through the count, then return the answer.')
+print(result.output)
+```
+
+The native capability gate requires GGUF `general.name` to identify Qwen3.6 and
+checks architecture, layer count, embedding width and expert count. Repacked
+files with missing or unrelated names are rejected; no other model is advertised.
+The mock tests do not verify a real client's installed Pydantic AI version.
+
+## Results in the implementation environment
+
+- Focused native-fixture, structured HTTP and reasoning-effort suite: 43 passed,
+  75 subtests passed.
+- Existing server regression suite: 353 passed, 431 subtests passed; one existing
+  telemetry test excluded after reproducing its failure in the unchanged checkout.
+  `TelemetryNoDisks.test_sampler_runs_without_disk_counters` expects mocked host
+  RAM while the implementation's existing container-memory override reports cgroup RAM.
+- CMake built `poly-grammar-check`, `poly-json-grammar-test` and
+  `poly-json-sampler-test`; the production sampler CTest passed.
+- `src/poly/main.cpp` passed host C++ syntax checks with the feature enabled and
+  disabled. Python syntax checks and `git diff --check` passed.
+- No model files were downloaded, installed, loaded or executed. Full CUDA
+  compilation/linking and real-model inference remain unverified.

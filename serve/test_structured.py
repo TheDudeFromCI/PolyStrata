@@ -1,5 +1,6 @@
 """Exercise the JSON contract through HTTP, including H3's strict Story shape."""
 import json
+import contextlib
 import unittest
 import urllib.error
 import urllib.request
@@ -53,6 +54,11 @@ class Structured(unittest.TestCase):
             return response.status, data if "event-stream" in response.headers.get("Content-Type", "") else json.loads(data)
 
     def setUp(self):
+        # These tests isolate the existing HTTP validation/buffering contract. Native enforcement
+        # and fail-closed capability checks are exercised in test_poly_grammar.py.
+        patch = mock.patch("serve.server.poly_grammar.request", return_value=contextlib.nullcontext(None))
+        patch.start()
+        self.addCleanup(patch.stop)
         self.tok = ByteTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
@@ -105,9 +111,9 @@ class Structured(unittest.TestCase):
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
         for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', 'no json at all', '{"x":'):
             self.assertEqual(self.chat(script, response_format=fmt)[0], 502)
-        # #762: the JSON object is taken out of a code fence or the prose around it (the object itself stays strict)
+        # Constrained content must be exactly JSON; prose extraction is no longer allowed.
         for script in ('```json\n{}\n```', 'Here it is: {"answer":4} - done'):
-            self.assertEqual(self.chat(script, response_format=fmt)[0], 200, script)
+            self.assertEqual(self.chat(script, response_format=fmt)[0], 502, script)
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
         # Plain text callers retain normal streaming, without a JSON validation gate.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
@@ -146,15 +152,9 @@ class Structured(unittest.TestCase):
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
 
-    def test_without_jsonschema_an_object_is_still_required(self):
-        # jsonschema is optional: without it json_schema answers are checked to be one JSON object, json_object
-        # never needs it, and nothing is imported at server start
+    def test_without_jsonschema_schema_mode_fails_closed(self):
         with mock.patch.object(structured, "_jsonschema", False):
-            self.assertEqual(self.chat()[0], 200)
-            for script in ("## Film Plan - Photobooth", "[1, 2]"):
-                code, reply = self.chat(script)
-                self.assertEqual(code, 502, script)
-                self.assertEqual(reply["error"]["code"], "structured_output_failed")
+            self.assertEqual(self.chat()[0], 400)
             self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)
 
     def test_root_unions_of_object_shapes_are_accepted(self):

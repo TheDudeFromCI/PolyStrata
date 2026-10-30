@@ -1,11 +1,11 @@
-"""JSON response formats at the HTTP boundary: prompt once, validate before delivery.
+"""JSON response formats at the HTTP boundary: prepare and independently validate before delivery.
 
-The native engine has no grammar decoder. Failed generations are errors, never
+The Qwen3.6 strata-poly OpenAI path uses llguidance (serve/poly_grammar.py). Failed generations are errors, never
 silently retried or returned as successful structured output.
 
-`jsonschema` is optional (no new hard dependency of the server): json_object needs only the standard library, and
-json_schema is checked against its schema when the package is installed - without it, only that the answer is one
-JSON object, and the server says so once.
+The constrained OpenAI schema path requires jsonschema for independent validation.
+The older Responses path retains its existing optional-validator behavior; json_object
+requires only the standard library for independent object validation.
 """
 import json
 import threading
@@ -80,7 +80,7 @@ def _only_objects(node, root, refs=()):
     return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
 
 
-def prepare_format(response_format, messages, with_tools=False):
+def prepare_format(response_format, messages, with_tools=False, constrained=False):
     if response_format is None:
         return messages, None
     if not isinstance(response_format, dict):
@@ -106,6 +106,12 @@ def prepare_format(response_format, messages, with_tools=False):
         modules = jsonschema_modules()
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
+
+    if constrained and kind == "json_schema" and modules is None:
+        raise ValueError("constrained json_schema requires jsonschema>=4.23,<5 for defense-in-depth validation")
+    if constrained:
+        from serve.poly_grammar import check_keywords
+        check_keywords(schema)
 
     def check_refs(node):
         if isinstance(node, dict):
@@ -136,6 +142,8 @@ def prepare_format(response_format, messages, with_tools=False):
                  "Use every required field, correct types, and only allowed fields. "
                  "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n" +
                  json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+    if constrained:
+        directive += "\nThis constraint applies only to the final answer. Reason normally before the final answer."
     if with_tools:
         # /v1/responses (#782): the schema is for the final answer; a turn that calls a tool is not an answer
         directive += ("\nThis applies only to your final answer. To use a tool, call it as usual; the JSON object is "
@@ -189,7 +197,7 @@ def _extract_json(text: str) -> str:
     return s[start:]
 
 
-def validated_json(text, validator, finish):
+def validated_json(text, validator, finish, strict=False):
     def pairs(items):
         obj = {}
         for key, value in items:
@@ -204,7 +212,7 @@ def validated_json(text, validator, finish):
     if finish != "stop":
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
     try:
-        value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
+        value = json.loads(text.strip() if strict else _extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
