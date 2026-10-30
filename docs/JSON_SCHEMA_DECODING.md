@@ -8,7 +8,7 @@ No model files are needed for the tests below. Do not run setup.py or setup.sh f
 
 Install the normal CUDA build prerequisites from docs/BACKENDS.md (on Manjaro:
 the NVIDIA driver, CUDA toolkit, GCC supported by that toolkit, CMake, Ninja,
-Python 3.10+). Install Rust 1.95.0 with Cargo. Then, from the project root:
+Python 3.10+). Install Rust/Cargo 1.95.0 or newer. Then, from the project root:
 
 ```sh
 git clone https://github.com/guidance-ai/llguidance.git third_party/llguidance
@@ -204,8 +204,8 @@ condition in this code.
 After syncing the implementation branch, run `./build.sh` from the checkout.
 It works from other working directories too. It fetches the exact llguidance and
 llama.cpp source commits above into `third_party/`, creates/reuses `.venv`, installs
-`requirements-grammar.txt` (including CMake/Ninja), selects Rust 1.95.0 through
-rustup when available, and builds `strata-poly` plus `poly-grammar-check` together
+`requirements-grammar.txt` (including CMake/Ninja), reuses active Rust/Cargo 1.95.0 or newer (including 1.98); if too old, installs
+1.95.0 through rustup when available, and builds `strata-poly` plus `poly-grammar-check` together
 in `build-json/`. Existing conflicting or modified dependency checkouts are
 reported instead of reset. Source fetches use normal Git/TLS authentication.
 

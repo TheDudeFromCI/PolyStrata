@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 LLG_REV=3d698ee07b3a67b0aef50fb6058612e8fd30aca2
 LLAMA_REV=3cf03257f219afbe7334045ff7c6a06ac68c627d
-RUST_VERSION=1.95.0
+RUST_MIN_VERSION=1.95.0
 JOBS=4
 ARCHS=${STRATA_CUDA_ARCHITECTURES:-86;120}
 MODE=cuda
@@ -95,12 +95,10 @@ fetch_source llguidance https://github.com/guidance-ai/llguidance.git "$LLG_REV"
 fetch_source llama.cpp https://github.com/ggml-org/llama.cpp.git "$LLAMA_REV"
 [[ $MODE != fetch ]] || { printf 'Pinned source dependencies are ready. No model files downloaded.\n'; exit 0; }
 
-if command -v rustup >/dev/null; then
-    rustup toolchain install "$RUST_VERSION" --profile minimal
-    export RUSTUP_TOOLCHAIN="$RUST_VERSION"
-else
-    [[ $(cargo --version) == "cargo $RUST_VERSION "* ]] || fail "Rust $RUST_VERSION is required; install it using rustup"
-fi
+# Use a suitable active compiler (including newer releases) rather than downgrade it.
+source "$ROOT/tools/build_rust_toolchain.sh"
+select_build_rust_toolchain "$RUST_MIN_VERSION" || fail "Could not select Rust/Cargo $RUST_MIN_VERSION or newer"
+
 if [[ ! -e $ROOT/.venv ]]; then
     python3 -m venv "$ROOT/.venv"
 fi
