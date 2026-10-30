@@ -18,7 +18,7 @@ def supported(engine):
 
 REASONS = {
     "not_compiled": "The running strata-poly executable was built without STRATA_POLY_LLGUIDANCE=ON.",
-    "drafts_enabled": "The running engine has draft generation enabled; add --no-draft and restart it.",
+    "drafts_enabled": "This older native build rejects drafts with JSON grammar; rebuild with draft verification support, or use --no-draft.",
     "batching_enabled": "Batching is enabled; remove --batch and restart the engine.",
     "model_name_mismatch": "GGUF general.name did not identify Qwen3.6; the metadata name check rejected it.",
     "architecture_mismatch": "GGUF architecture is not qwen35moe.",
@@ -37,7 +37,7 @@ def unavailable_reason(engine):
         return REASONS["batching_enabled"]
     reason = (getattr(engine, "info", {}) or {}).get("json_schema_reason")
     return REASONS.get(reason, "The running executable did not advertise json_schema_llguidance. "
-                       "Check the configured exe path, STRATA_POLY_LLGUIDANCE=ON, --no-draft, "
+                       "Check the configured exe path, STRATA_POLY_LLGUIDANCE=ON, "
                        "and that --batch is absent; older binaries do not report the exact failed check.")
 
 

@@ -901,6 +901,7 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.json_schema_llguidance = "json_schema_llguidance" in f[2:]
+                self.json_schema_drafts = "json_schema_drafts" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -4299,7 +4300,9 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"] if poly_grammar.supported(self.engine) else [],
                                   "method": "llguidance" if poly_grammar.supported(self.engine) else "unavailable",
                                   "constrained_decoding": poly_grammar.supported(self.engine), "stream_buffered": True,
-                                  "unavailable_reason": poly_grammar.unavailable_reason(self.engine)},
+                                  "unavailable_reason": poly_grammar.unavailable_reason(self.engine),
+                                  "draft_verification": poly_grammar.supported(self.engine) and
+                                      bool(getattr(self.engine, "json_schema_drafts", False))},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,

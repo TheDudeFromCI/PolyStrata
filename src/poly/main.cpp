@@ -11,6 +11,7 @@
 #include "json_grammar.hpp"
 #endif
 #include "guesses.hpp"
+#include "draft_verify.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -391,8 +392,8 @@ struct Session {
 #ifdef STRATA_POLY_LLGUIDANCE
         std::unique_ptr<strata::poly::JsonGrammar> grammar;
         if (!s.grammar_file.empty()) {
-            if (engine.sequences() != 1 || engine.drafts() || follow)
-                throw std::runtime_error("structured decoding requires --batch 1, MTP off, no --follow");
+            if (engine.sequences() != 1 || follow)
+                throw std::runtime_error("structured decoding requires batching off and no --follow");
             strata::poly::GrammarInput in(s.grammar_file);
             engine.validate_grammar_tokens(in.pieces, in.close);
             grammar = std::make_unique<strata::poly::JsonGrammar>(in.pieces, in.eos, in.close,
@@ -514,14 +515,6 @@ struct Session {
             int32_t t = pick(engine.logits());   // picked, and not shown yet
             while (show(t)) {
                 // t goes into the model now, and with it guesses at what follows when there are any that pay
-#ifdef STRATA_POLY_LLGUIDANCE
-                if (grammar) {
-                    engine.eval(&t, 1, true);
-                    kept.read(&t, 1);
-                    t = pick(engine.logits());
-                    continue;
-                }
-#endif
                 const Clock::time_point round = Clock::now();
                 const bool room = engine.pos() + most <= engine.max_context();
                 const int offered = look && room ? repeats.propose(most - 1, w + 1) : 0;
@@ -560,16 +553,15 @@ struct Session {
                 engine.window(w, use.t);
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
-                int right = 0;
-                bool more = true;
-                t = pick(engine.logits_of(0));
-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
-                engine.keep(right + 1);
-                kept.read(w, right + 1);
+                const auto verified = strata::poly::verify_draft_window(w, use.t,
+                    [&](int row) { return pick(engine.logits_of(row)); }, show);
+                t = verified.next;
+                engine.keep(verified.fed);
+                kept.read(w, verified.fed);
                 r.guessed += use.t - 1;
-                r.guessed_right += right + (more ? 0 : 1);
-                policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
-                if (!more) break;
+                r.guessed_right += verified.accepted;
+                policy.observe(use.lookup, use.t, verified.fed - 1, match, count(use.t, verified.fed));
+                if (!verified.more) break;
             }
         }
         r.decode_ms = ms_since(t0);
@@ -649,11 +641,10 @@ int serve(Session& ss) {
                 (long long) engine.vram_free_mib(), (int) slots.size());
 #ifdef STRATA_POLY_LLGUIDANCE
     std::string grammar_reason = engine.json_grammar_rejection();
-    if (grammar_reason.empty() && engine.drafts()) grammar_reason = "drafts_enabled";
     if (grammar_reason.empty() && !slots.empty()) grammar_reason = "batching_enabled";
     std::printf("INFO json_schema_reason=%s\n", grammar_reason.empty() ? "ready" : grammar_reason.c_str());
     std::printf("READY %d stop%s\n", engine.max_context(),
-                grammar_reason.empty() ? " json_schema_llguidance" : "");
+                grammar_reason.empty() ? " json_schema_llguidance json_schema_drafts" : "");
 #else
     std::printf("INFO json_schema_reason=not_compiled\n");
     std::printf("READY %d stop\n", engine.max_context());

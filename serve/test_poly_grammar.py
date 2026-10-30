@@ -110,6 +110,27 @@ class Protocol(unittest.TestCase):
             self.assertEqual(close,257)
         self.assertFalse(Path(path).exists())
 
+    def test_native_draft_capability_handshake(self):
+        import sys
+        from serve.server import StrataEngine
+        for flags, expected in [('json_schema_llguidance json_schema_drafts',True),
+                                ('json_schema_llguidance',False)]:
+            with tempfile.TemporaryDirectory() as directory:
+                script=Path(directory)/'fake_native.py'
+                script.write_text("import sys\nprint('READY 4096 stop " + flags + "',flush=True)\n"
+                                  "for line in sys.stdin:\n if line.startswith('QUIT'): break\n")
+                from unittest import mock
+                import serve.server as server
+                real_popen=server.subprocess.Popen
+                with mock.patch.object(server.subprocess,'Popen',
+                        lambda cmd,**kw: real_popen([sys.executable,'-u',str(script),*cmd[1:]],**kw)):
+                    engine=StrataEngine('strata',[])
+                    try:
+                        self.assertTrue(poly_grammar.supported(engine))
+                        self.assertEqual(engine.json_schema_drafts,expected)
+                    finally:
+                        engine.close()
+
     def test_no_fallback(self):
         with self.assertRaises(ValueError):
             with poly_grammar.request(SimpleNamespace(), Vocabulary(), {256}, {'type': 'object'}):
@@ -156,6 +177,7 @@ class API(unittest.TestCase):
         self.tok = Tok()
         class Engine(MockEngine):
             json_schema_llguidance = True
+            json_schema_drafts = True
             spawn = (str(Path(os.environ.get('POLY_GRAMMAR_CHECK', '/tmp/poly-grammar-check')).with_name('strata-poly')), [])
         self.engine = Engine(self.tok, 'Thought {invalid}</think>{"x":1}', max_context=8192)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent/'chat_template.jinja'))
@@ -276,6 +298,7 @@ class API(unittest.TestCase):
 
     def test_capability_reporting(self):
         self.assertTrue(self.svc.v1_status()['structured_output']['constrained_decoding'])
+        self.assertTrue(self.svc.v1_status()['structured_output']['draft_verification'])
         self.assertEqual(self.svc.v1_status()['structured_output']['method'],'llguidance')
         self.engine.json_schema_llguidance=False
         self.assertFalse(self.svc.v1_status()['structured_output']['constrained_decoding'])

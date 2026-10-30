@@ -1,7 +1,7 @@
 # Qwen3.6 structured responses with llguidance
 
 This opt-in decoder targets Qwen3.6-35B-A3B, Linux, NVIDIA CUDA, `strata-poly`,
-`/v1/chat/completions`, with MTP and batching off. It does not change `strata`.
+`/v1/chat/completions`, with batching off. Native MTP and lookup drafts are supported. It does not change `strata`.
 No model files are needed for the tests below. Do not run setup.py or setup.sh for these tests.
 
 ## Build and deploy
@@ -18,18 +18,19 @@ python3 -m venv .venv
 cmake -S . -B build-json -G Ninja -DSTRATA_ENABLE_CUDA=ON \
   -DSTRATA_POLY_LLGUIDANCE=ON -DSTRATA_BUILD_TESTS=ON \
   -DLLGUIDANCE_SOURCE_DIR="$PWD/third_party/llguidance"
-cmake --build build-json --target strata-poly poly-grammar-check poly-json-grammar-test poly-json-sampler-test -j4
+cmake --build build-json --target strata-poly poly-grammar-check poly-json-grammar-test poly-json-sampler-test poly-json-draft-test -j4
 ```
 
 Use the existing Qwen3.6 model configuration, with `exe` pointing to the newly
-built `strata-poly` and `--no-draft` in `args`. Leave batching off. Install
+built `strata-poly`. Remove `--no-draft` from `args` to enable MTP; keeping it
+turns MTP off. Leave batching off. Install
 `poly-grammar-check` beside `strata-poly` if moving the executables. This helper
 validates schemas locally; it never loads a model. The Cargo lockfile and exact
 source commit pin llguidance 1.9.1. A wrong source commit is a CMake error.
 
 `/v1/status.structured_output.constrained_decoding` must be true and `method`
 must be `llguidance` after loading this engine. Native READY advertises
-`json_schema_llguidance` only for the supported model shape, with drafts/batching
+`json_schema_llguidance` only for the supported model shape, with batching
 off. Unsupported engines reject structured OpenAI requests, rather than falling
 back to prompt-only generation. Ordinary text requests retain their previous path.
 
@@ -63,8 +64,12 @@ reasoning-close retry. Budget exhaustion before a complete answer is an error.
 Every final token is sampled from grammar-masked CPU logits before penalties,
 top-k, top-p, min-p, temperature and the draw. The original logits remain intact.
 The engine stops at accepting root completion, without requiring an EOS draw.
-All lookup and draft speculation is bypassed for the whole constrained request,
-including its reasoning phase. No extra GPU transfer or per-token Python grammar
+MTP and lookup may propose tokens during both phases. Each proposal is checked
+against a fresh main-model sample: unrestricted during reasoning, grammar-masked
+in the final answer. Only emitted tokens advance grammar state. A rejected suffix
+is discarded through the existing engine.keep() path; the matcher needs no rollback.
+An accepted </think> activates masking for the very next token, even inside a window.
+Completion, cancellation and budget stops discard the remainder of the window. No extra GPU transfer or per-token Python grammar
 callback is introduced. Final content is buffered, parsed as exactly one JSON
 object, and independently validated before delivery; prose extraction is disabled.
 
@@ -97,8 +102,8 @@ The grammar targets can be built without CUDA for local tests:
 cmake -S . -B build-json-tests -G Ninja -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_POLY_LLGUIDANCE=ON -DSTRATA_BUILD_TESTS=ON \
   -DLLGUIDANCE_SOURCE_DIR="$PWD/third_party/llguidance"
-cmake --build build-json-tests --target poly-grammar-check poly-json-grammar-test poly-json-sampler-test -j4
-ctest --test-dir build-json-tests -R '^poly-json-sampler-test$' --output-on-failure
+cmake --build build-json-tests --target poly-grammar-check poly-json-grammar-test poly-json-sampler-test poly-json-draft-test -j4
+ctest --test-dir build-json-tests -R '^poly-json-(sampler|draft)-test$' --output-on-failure
 POLY_GRAMMAR_TEST="$PWD/build-json-tests/poly-json-grammar-test" \
 POLY_GRAMMAR_CHECK="$PWD/build-json-tests/poly-grammar-check" \
   .venv/bin/python -m pytest -q serve/test_poly_grammar.py serve/test_structured.py serve/test_effort_paths.py
@@ -113,7 +118,9 @@ There are no model weights or GPU inference in these tests.
 Per-token overhead is a native grammar mask plus one vocabulary pass into a
 reusable float buffer. No mask work occurs during reasoning. Per-request costs
 include vocabulary export/checking, schema preflight and tokenizer-trie creation;
-these are not cached yet. Structured requests lose speculative speedups. No
+these are not cached yet. Invalid draft proposals reduce acceptance and may limit
+speculative speedups. The existing sample-and-compare verification policy is used;
+this is not distribution-ratio speculative sampling. No
 real-model throughput or reliability measurement is claimed. Complete CUDA
 linking, GPU execution and the actual Qwen tokenizer/model combination require
 verification on the target machine; the development test machine has no CUDA
@@ -167,8 +174,8 @@ The mock tests do not verify a real client's installed Pydantic AI version.
 configuration and normally uses `engine-poly/strata-poly`. It does not select a
 binary just because you built `build-json/strata-poly`. Its build path does not
 enable the opt-in llguidance feature. For this custom build, set the active
-configuration's `exe` to the absolute path of `build-json/strata-poly`, add
-`--no-draft` to its existing `args` list, and remove `--batch` and its value if
+configuration's `exe` to the absolute path of `build-json/strata-poly`, remove
+`--no-draft` from its existing `args` list to enable MTP, and remove `--batch` and its value if
 present. Keep the model path, layer split, context and memory settings.
 
 Start that configuration directly, so installer engine selection/build logic
@@ -182,9 +189,12 @@ Here `--engine strata` selects the existing Python native-process wrapper; the
 configuration's `exe` selects the actual `strata-poly` executable.
 
 With the diagnostic update, `/v1/status.structured_output.unavailable_reason`
-reports the native gate that failed: missing compile option, draft generation,
-batching, GGUF name, architecture or shape. Older native executables cannot
+reports the native gate that failed: missing compile option, batching, GGUF name,
+architecture or shape. A drafts_enabled reason comes only from older native builds.
+Older native executables cannot
 report an exact gate; the server then says their READY line lacks the capability
-flag. A one-request concurrency value alone cannot diagnose draft generation or
+flag. `/v1/status.structured_output.draft_verification` reports support for the
+updated verifier. See [JSON_SCHEMA_DRAFTS.md](JSON_SCHEMA_DRAFTS.md). A one-request
+concurrency value alone cannot diagnose draft generation or
 which executable is running. Two GPUs appearing in telemetry is not a rejection
 condition in this code.
