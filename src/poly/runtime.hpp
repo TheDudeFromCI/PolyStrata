@@ -119,7 +119,11 @@ inline std::vector<float> clamp_limits(const MetaValue* v, int n_layer) {
 class Shards {
 public:
     explicit Shards(const std::string& path) {
+#ifdef STRATA_POLY_LLGUIDANCE
+        files_.push_back(std::make_unique<GgufFile>(path, true));
+#else
         files_.push_back(std::make_unique<GgufFile>(path));
+#endif
         paths_.push_back(path);
         const MetaValue* no = files_[0]->get("split.no");
         const MetaValue* count = files_[0]->get("split.count");

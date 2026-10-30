@@ -58,6 +58,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import poly_grammar  # noqa: E402
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, gemma_model_turn, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
@@ -899,6 +900,8 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.json_schema_llguidance = "json_schema_llguidance" in f[2:]
+                self.json_schema_drafts = "json_schema_drafts" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -1986,6 +1989,13 @@ class StrataEngine:
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         keys = self.sampling_keys(sampling or {}) + self.turn_key(ids)
+        if (sampling or {}).get("_poly_grammar"):
+            if not poly_grammar.supported(self):
+                raise StructuredOutputError("engine no longer supports constrained decoding")
+            path = sampling["_poly_grammar"]
+            if any(c.isspace() for c in path):
+                raise StructuredOutputError("invalid grammar transport path")
+            keys += f" json_grammar={path} json_reasoning={int(sampling['_poly_reasoning'])}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
@@ -4076,6 +4086,8 @@ class Service:
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
+        if any(k.startswith("_poly_") for k in req):
+            req = {k: v for k, v in req.items() if not k.startswith("_poly_")}
         s = self.shared
         effort = self.effort_default()
         if not s and not effort:
@@ -4285,8 +4297,12 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            "structured_output": {"formats": ["json_object", "json_schema"] if poly_grammar.supported(self.engine) else [],
+                                  "method": "llguidance" if poly_grammar.supported(self.engine) else "unavailable",
+                                  "constrained_decoding": poly_grammar.supported(self.engine), "stream_buffered": True,
+                                  "unavailable_reason": poly_grammar.unavailable_reason(self.engine),
+                                  "draft_verification": poly_grammar.supported(self.engine) and
+                                      bool(getattr(self.engine, "json_schema_drafts", False))},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -4749,6 +4765,20 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
                               call_format=self.call_format, opened=opened)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        constrained = bool((sampling or {}).get("_poly_grammar"))
+        def feed_token(t):
+            if not constrained:
+                return parser.feed(detok.push(t))
+            if parser.state == "reasoning" and t == sampling["_poly_close"]:
+                # Flush a partial reasoning codepoint on its own channel, never into the JSON.
+                pending = detok.inc.decode(b"", final=True) if detok.inc is not None else ""
+                if detok.inc is not None:
+                    detok.inc.reset()
+                parser.state = "content"
+                return [Event("reasoning", pending)] if pending else []
+            piece = detok.push(t)
+            return [Event("reasoning" if parser.state == "reasoning" else "content", piece)] if piece else []
+
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
@@ -4875,6 +4905,8 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if constrained:
+                            sampling = {**sampling, "_poly_reasoning": parser.state == "reasoning"}
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -4912,13 +4944,16 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                piece = detok.push(t)
-                                tail = (tail + piece)[-2:]
-                                evs = cut(parser.feed(piece))
+                                if constrained:
+                                    evs = cut(feed_token(t))
+                                else:
+                                    piece = detok.push(t)
+                                    tail = (tail + piece)[-2:]
+                                    evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                    if not constrained and self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
@@ -4965,6 +5000,8 @@ class Service:
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
                             print(f"[strata] the engine reported an error: {e}", flush=True)
+                            if constrained:
+                                raise StructuredOutputError(str(e)) from e
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -4982,6 +5019,9 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if constrained and (getattr(self.engine, "last", {}) or {}).get("finish") == "stop" and parser.state == "content":
+                            # The native matcher stops on root acceptance without sampling an EOS token.
+                            finish = "stop"
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -5024,7 +5064,7 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                        if (not constrained and self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != parser.think_end  # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
@@ -5039,7 +5079,7 @@ class Service:
                                     n += 1
                                     raw_ids.append(t)
                                     thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
+                                    evs = cut(feed_token(t))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
@@ -5069,7 +5109,7 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            evs = cut(feed_token(t))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
@@ -5506,7 +5546,7 @@ def openai_collect(chunks) -> dict:
     return out
 
 
-def structured_chunks(chunks, validator):
+def structured_chunks(chunks, validator, strict=False):
     """Buffer structured streams so a client never receives unvalidated content."""
     buffered = []
     heartbeat = time.monotonic()
@@ -5520,7 +5560,7 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
+        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"], strict=strict)
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
@@ -6545,7 +6585,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
+            messages, validator = prepare_format(req.get("response_format"), messages, constrained=True)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
@@ -6567,41 +6607,48 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = self.cancel                             # watched since _post() (#430 #431 #1999)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            schema = None
             if validator is not None:
-                chunks = structured_chunks(chunks, validator)
-            chunks = self._capture(chunks, "openai")
-            if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
-            self._sse()
-            try:
-                for c in chunks:
-                    if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
-                    else:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                self._note(outcome="disconnected")
-                cancel.set()                                 # client went away: stop the engine
-                chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except StructuredOutputError as e:
-                err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except ValueError as e:                          # the engine's ERR after the stream started: the
-                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-
+                fmt = req["response_format"]
+                schema = fmt["json_schema"]["schema"] if fmt["type"] == "json_schema" else {"type": "object"}
+            context = poly_grammar.request(svc.engine, svc.tok, svc.stop_ids, schema) if schema is not None else contextlib.nullcontext(None)
+            with context as grammar:
+                if grammar is not None:
+                    req = {**req, "_poly_grammar": grammar[0], "_poly_close": grammar[1]}
+                _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+                run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                   {t["name"] for t in extra}) if use_mcp else None
+                chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                if validator is not None:
+                    chunks = structured_chunks(chunks, validator, strict=True)
+                chunks = self._capture(chunks, "openai")
+                if not req.get("stream"):
+                    return self._json(200, openai_collect(chunks))
+                self._sse()
+                try:
+                    for c in chunks:
+                        if c is None:
+                            self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        else:
+                            self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
+                    cancel.set()                                 # client went away: stop the engine
+                    chunks.close()
+                except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+                    err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except StructuredOutputError as e:
+                    err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except ValueError as e:                          # the engine's ERR after the stream started: the
+                    err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
             if not req.get("stream"):

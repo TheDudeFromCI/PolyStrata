@@ -7,7 +7,11 @@
 // STOP and QUIT in, and RESUME, PP, T, DONE and ERR out.
 #include "conversations.hpp"
 #include "engine.hpp"
+#ifdef STRATA_POLY_LLGUIDANCE
+#include "json_grammar.hpp"
+#endif
 #include "guesses.hpp"
+#include "draft_verify.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -78,6 +82,8 @@ constexpr int kCopyMatch = 8;
 constexpr int kPiece = 8;
 
 struct Sampling {
+    std::string grammar_file;
+    bool grammar_reasoning = false;
     float temperature = 0.f;   // 0: the most likely token
     float top_p = 1.f, min_p = 0.f;
     int top_k = 20;            // 0: no limit
@@ -90,7 +96,7 @@ struct Sampling {
 class Sampler {
 public:
     int pick(const float* logits, int n_vocab, const Sampling& s, const std::vector<int32_t>& history,
-             std::mt19937_64& rng) {
+             std::mt19937_64& rng, bool constrained = false) {
         if (penalizes(s)) {
             pen_.assign(logits, logits + n_vocab);
             penalize(s, history);
@@ -104,6 +110,7 @@ public:
         const size_t k = s.top_k > 0 ? std::min((size_t) s.top_k, (size_t) n_vocab) : (size_t) n_vocab;
         cand_.clear();
         for (int i = 0; i < n_vocab; ++i) {
+            if (constrained && !std::isfinite(logits[i])) continue;
             if (cand_.size() == k) {
                 if (!(logits[i] > cand_.front().logit)) continue;   // an equal with a higher id is no better
                 std::pop_heap(cand_.begin(), cand_.end(), by_logit);
@@ -113,6 +120,7 @@ public:
             }
             std::push_heap(cand_.begin(), cand_.end(), by_logit);
         }
+        if (constrained && cand_.empty()) throw std::runtime_error("no finite sampling candidates");
         std::sort_heap(cand_.begin(), cand_.end(), by_logit);
 
         if (s.top_p < 1.f) {
@@ -381,6 +389,19 @@ struct Session {
                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
         Result r;
+#ifdef STRATA_POLY_LLGUIDANCE
+        std::unique_ptr<strata::poly::JsonGrammar> grammar;
+        if (!s.grammar_file.empty()) {
+            if (engine.sequences() != 1 || follow)
+                throw std::runtime_error("structured decoding requires batching off and no --follow");
+            strata::poly::GrammarInput in(s.grammar_file);
+            engine.validate_grammar_tokens(in.pieces, in.close);
+            grammar = std::make_unique<strata::poly::JsonGrammar>(in.pieces, in.eos, in.close,
+                                                               s.grammar_reasoning, in.schema);
+        }
+#else
+        if (!s.grammar_file.empty()) throw std::runtime_error("llguidance is not compiled in");
+#endif
         const int64_t n = (int64_t) ids.size();
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
         engine.images(pictures.at.data(), (int) pictures.at.size());
@@ -466,14 +487,23 @@ struct Session {
         const auto pick = [&](const float* logits) {
             picked_from = logits;
             if (follow && r.produced < (int64_t) follow->size()) return (*follow)[(size_t) r.produced];
+#ifdef STRATA_POLY_LLGUIDANCE
+            if (grammar) return (int32_t) sampler.pick(grammar->mask(logits), engine.n_vocab(), s, history, rng, true);
+#endif
             return (int32_t) sampler.pick(logits, engine.n_vocab(), s, history, rng);
         };
         // Shows a token.  False when the answer ends with it.
         const auto show = [&](int32_t t) {
+#ifdef STRATA_POLY_LLGUIDANCE
+            if (grammar) grammar->accept(t);
+#endif
             on_token(t);
             ++r.produced;
             history.push_back(t);
             if (look) repeats.append(t);
+#ifdef STRATA_POLY_LLGUIDANCE
+            if (grammar && grammar->complete()) { r.finish = "stop"; return false; }
+#endif
             if (is_eos(t)) r.finish = "stop";
             else if (stop.load()) r.finish = "cancel";
             else return r.produced < max_new;
@@ -523,16 +553,15 @@ struct Session {
                 engine.window(w, use.t);
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
-                int right = 0;
-                bool more = true;
-                t = pick(engine.logits_of(0));
-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
-                engine.keep(right + 1);
-                kept.read(w, right + 1);
+                const auto verified = strata::poly::verify_draft_window(w, use.t,
+                    [&](int row) { return pick(engine.logits_of(row)); }, show);
+                t = verified.next;
+                engine.keep(verified.fed);
+                kept.read(w, verified.fed);
                 r.guessed += use.t - 1;
-                r.guessed_right += right + (more ? 0 : 1);
-                policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
-                if (!more) break;
+                r.guessed_right += verified.accepted;
+                policy.observe(use.lookup, use.t, verified.fed - 1, match, count(use.t, verified.fed));
+                if (!verified.more) break;
             }
         }
         r.decode_ms = ms_since(t0);
@@ -573,6 +602,8 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
         else if (key == "penalty_present") s.penalty_present = std::strtof(v, nullptr);
         else if (key == "seed") s.seed = std::strtoull(v, nullptr, 10);
         else if (key == "image_pad") pad = (int32_t) std::atoi(v);
+        else if (key == "json_grammar") s.grammar_file = v;
+        else if (key == "json_reasoning") s.grammar_reasoning = std::atoi(v) != 0;
         else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
         // other keys belong to the other engine and are skipped
     }
@@ -608,7 +639,16 @@ int serve(Session& ss) {
                 engine.max_context(), engine.cached_experts(), (long long) (engine.cached_gib() * 1024.0),
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
                 (long long) engine.vram_free_mib(), (int) slots.size());
+#ifdef STRATA_POLY_LLGUIDANCE
+    std::string grammar_reason = engine.json_grammar_rejection();
+    if (grammar_reason.empty() && !slots.empty()) grammar_reason = "batching_enabled";
+    std::printf("INFO json_schema_reason=%s\n", grammar_reason.empty() ? "ready" : grammar_reason.c_str());
+    std::printf("READY %d stop%s\n", engine.max_context(),
+                grammar_reason.empty() ? " json_schema_llguidance json_schema_drafts" : "");
+#else
+    std::printf("INFO json_schema_reason=not_compiled\n");
     std::printf("READY %d stop\n", engine.max_context());
+#endif
     std::fflush(stdout);
 
     static Lines lines;   // its thread may still be in a read when this function returns

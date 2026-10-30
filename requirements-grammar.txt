@@ -1,0 +1,3 @@
+-r requirements.txt
+# Required for independent validation of llguidance-constrained OpenAI responses.
+jsonschema==4.26.0
