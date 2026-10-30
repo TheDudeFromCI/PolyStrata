@@ -48,6 +48,17 @@ class Native(unittest.TestCase):
                   'additionalProperties': False}
         self.valid(schema, {'children': [{'s': 'hé😀"\\\n', 'n': 3, 'b': True}], 'optional': None, 'literal': 'ok'})
 
+    def test_sampled_metadata_reproduces_original_error(self):
+        with tempfile.NamedTemporaryFile() as f:
+            poly_grammar.write_request(f,Vocabulary(),{256},{'type':'object'})
+            f.flush()
+            result=subprocess.run([os.environ['POLY_GRAMMAR_TEST'],f.name,'metadata_sample'],
+                input='123 125',text=True,capture_output=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('request_vocab=260',result.stderr)
+            self.assertIn('model_vocab=260',result.stderr)
+            self.assertIn('count=260,retained=64',result.stderr)
+
     def test_refs_and_numeric(self):
         schema = {'type': 'object', '$defs': {'n': {'type': 'number', 'minimum': 0.5,
                   'exclusiveMaximum': 3, 'multipleOf': 0.5}}, 'properties': {'x': {'$ref': '#/$defs/n'}},
@@ -226,6 +237,42 @@ class API(unittest.TestCase):
         status, raw = self.chat(response_format={'type':'text'}, _poly_grammar='/etc/passwd')
         self.assertEqual(status,200,raw)
         self.assertNotIn('_poly_grammar',self.calls[-1])
+
+    def run_native_http_requests(self, requests):
+        from serve.structured import StructuredOutputError
+        answers=[]
+        def generate(ids,max_new,sampling,cancel,**kw):
+            self.calls.append(dict(sampling))
+            text=answers.pop(0)
+            result=subprocess.run([os.environ['POLY_GRAMMAR_TEST'],sampling['_poly_grammar'],'final'],
+                input=' '.join(map(str,text.encode())),text=True,capture_output=True)
+            if result.returncode:
+                raise StructuredOutputError(result.stderr)
+            yield from text.encode()
+            self.engine.last={'finish':'stop'}
+        self.engine.generate=generate
+        for schema,value in requests:
+            answers.append(json.dumps(value,separators=(',',':')))
+            code,raw=self.chat(reasoning_effort='none',stream=True,response_format={
+                'type':'json_schema','json_schema':{'name':'answer','strict':True,'schema':schema}})
+            self.assertEqual(code,200,raw)
+            chunks=[json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: {')]
+            self.assertFalse(any('error' in chunk for chunk in chunks),raw)
+            content=''.join(chunk['choices'][0]['delta'].get('content','') for chunk in chunks)
+            parsed=json.loads(content)
+            jsonschema.Draft202012Validator(schema).validate(parsed)
+            self.assertEqual(parsed,value)
+
+    @unittest.skipUnless(os.environ.get('POLY_GRAMMAR_TEST') and Path(os.environ.get('POLY_GRAMMAR_CHECK','/tmp/poly-grammar-check')).exists(),'native fixtures required')
+    def test_direct_api_simple_schema_cold_service(self):
+        self.run_native_http_requests([({'type':'object','properties':{'x':{'const':1}},
+            'required':['x'],'additionalProperties':False},{'x':1})])
+
+    @unittest.skipUnless(os.environ.get('POLY_GRAMMAR_TEST') and Path(os.environ.get('POLY_GRAMMAR_CHECK','/tmp/poly-grammar-check')).exists(),'native fixtures required')
+    def test_direct_api_repeated_alternating_schemas_warm_service(self):
+        a=({'type':'object','properties':{'x':{'const':1}},'required':['x'],'additionalProperties':False},{'x':1})
+        b=({'type':'object','properties':{'label':{'enum':['warm','cold']}},'required':['label'],'additionalProperties':False},{'label':'warm'})
+        self.run_native_http_requests([a,a,b,a,b,b,a])
 
     def test_capability_reporting(self):
         self.assertTrue(self.svc.v1_status()['structured_output']['constrained_decoding'])

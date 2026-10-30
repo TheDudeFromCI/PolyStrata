@@ -1,7 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
-#include "grammar_token_bytes.hpp"
+#include "grammar_metadata.hpp"
 
 #include "deepseek4.hpp"
 #include "gemma4.hpp"
@@ -3802,13 +3802,6 @@ void Engine::validate_grammar_tokens(const std::vector<std::string>& pieces, int
     if (!supports_json_grammar()) throw std::runtime_error("structured decoding requires Qwen3.6-35B-A3B");
     const auto* tokens = gg_->get("tokenizer.ggml.tokens");
     const auto* types = gg_->get("tokenizer.ggml.token_type");
-    if (!tokens || !types || tokens->items.size() != pieces.size() || pieces.size() != size_t(n_vocab_) ||
-        types->items.size() != pieces.size()) throw std::runtime_error("grammar tokenizer metadata mismatch");
-    if (close < 0 || size_t(close) >= pieces.size() || tokens->items[close].s != "</think>")
-        throw std::runtime_error("invalid reasoning transition token");
-    for (size_t i = 0; i < pieces.size(); ++i) {
-        if (grammar_token_bytes(tokens->items[i].s, types->items[i].u) != pieces[i])
-            throw std::runtime_error("grammar tokenizer bytes differ from model at ID " + std::to_string(i));
-    }
+    validate_grammar_metadata(tokens, types, size_t(n_vocab_), pieces, close);
 }
 }

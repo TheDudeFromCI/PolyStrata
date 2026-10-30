@@ -4,6 +4,7 @@
 #undef main
 #include <cassert>
 #include "grammar_token_bytes.hpp"
+#include "grammar_metadata_fixture.hpp"
 namespace strata::poly {
 int most_likely(const float* logits, int n) {
     return int(std::max_element(logits, logits + n) - logits);
@@ -27,6 +28,24 @@ int main() {
     std::vector<std::string> pieces;
     for (int i=0;i<256;++i) pieces.emplace_back(1,char(i));
     pieces.emplace_back(); pieces.emplace_back();
+    auto full = strata::poly::fixture::metadata(pieces,257);
+    strata::poly::validate_grammar_metadata(&full.first,&full.second,pieces.size(),pieces,257);
+    auto sample = strata::poly::fixture::metadata(pieces,257,false);
+    assert(sample.first.count==pieces.size() && sample.first.items.size()==64);
+    assert(sample.second.count==pieces.size() && sample.second.items.size()==64);
+    rejected=false;
+    try { strata::poly::validate_grammar_metadata(&sample.first,&sample.second,pieces.size(),pieces,257); }
+    catch(const std::exception& e) { rejected=std::string(e.what()).find("retained=64")!=std::string::npos; }
+    assert(rejected);
+    rejected=false;
+    try { strata::poly::validate_grammar_metadata(&full.first,&full.second,pieces.size()+1,pieces,257); }
+    catch(const std::exception& e) { rejected=std::string(e.what()).find("model_vocab=259")!=std::string::npos; }
+    assert(rejected);
+    auto tampered=pieces; tampered[100]="wrong";
+    rejected=false;
+    try { strata::poly::validate_grammar_metadata(&full.first,&full.second,pieces.size(),tampered,257); }
+    catch(const std::exception& e) { rejected=std::string(e.what()).find("ID 100")!=std::string::npos; }
+    assert(rejected);
     for (int top_k : {0, 1, 20}) for (float temperature : {0.f, 0.7f, 2.f}) {
         strata::poly::JsonGrammar grammar(pieces, {256}, 257, false,
             R"({"type":"object","properties":{"x":{"const":1}},"required":["x"],"additionalProperties":false})");
